@@ -331,8 +331,11 @@ def answer_question(question):
         group_field = None
 
     units = bool(re.search(r"\bunits?\b|quantity|qty|items sold|pieces", q))
-    count_mode = bool(re.search(r"how many|number of|count of|\bcount\b", q)) and not units
-    avg_mode = bool(re.search(r"average|avg|mean", q))
+    money_q = bool(re.search(r"how many (?:us |u\.s\. )?(?:dollars|usd|bucks)|how much|\$|\busd\b|worth|value|revenue|spent|spend|sales amount", q))
+    avg_mode = bool(re.search(r"average|\bavg\b|\bmean\b|per order|typical", q))
+    count_mode = (bool(re.search(r"how many|number of|count of|\bcount\b", q))
+                  and not units and not avg_mode
+                  and not re.search(r"how many (?:us |u\.s\. )?(?:dollars|usd|bucks)", q))
     lowest = bool(re.search(r"\b(least|lowest|fewest|smallest|minimum|min|worst)\b", q))
 
     rows = filt(orders, status)
@@ -361,7 +364,7 @@ def answer_question(question):
             scored = sorted(groups.items(), key=lambda kv: (metric(kv[1]), kv[0]))
         return scored[0][0]
 
-    if re.search(r"distinct|unique", q) and re.search(r"customer", q):
+    if re.search(r"customer", q) and re.search(r"distinct|unique|different|how many customers|number of customers", q) and not group_field:
         return len({o["customer"] for o in rows})
 
     val = metric(rows)
