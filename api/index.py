@@ -319,11 +319,11 @@ def answer_question(question):
 
     # grouping questions: which product/customer/region ...
     group_field = None
-    if re.search(r"\bwhich (product|item)|top product|best[- ]selling|most popular product|product (had|has|with|generated|brought)|what product", q):
+    if re.search(r"\bwhich (product|item)|top[- ]?(selling |grossing |earning )?product|best[- ]selling|highest[- ]\w+ product|most popular product|product (had|has|with|generated|brought)|what product|(top|best|worst)[- ]\w+ (product|item)", q):
         group_field = "product"
-    elif re.search(r"\bwhich customer|top customer|what customer|customer (had|has|with|spent|generated)|biggest customer|best customer", q):
+    elif re.search(r"\bwhich customer|top[- ]?(\w+ )?customer|what customer|customer (had|has|with|spent|generated)|biggest customer|best customer|(highest|largest)[- ]\w+ customer", q):
         group_field = "customer"
-    elif re.search(r"\bwhich region|top region|what region|region (had|has|with|generated)", q):
+    elif re.search(r"\bwhich region|top[- ]?(\w+ )?region|what region|region (had|has|with|generated)|(best|worst|highest|lowest)[- ]\w+ region", q):
         group_field = "region"
     elif re.search(r"\bwhich month|what month", q):
         group_field = "month"
@@ -373,6 +373,84 @@ def answer_question(question):
     return round(val + 1e-9, 2)
 
 
+LLM_SYSTEM = """You convert a business question about an order ledger into a JSON query. Output ONLY a JSON object with keys:
+metric: one of "revenue" (sum of USD amount), "order_count", "units" (sum of qty), "avg_order_value" (mean USD amount per order), "distinct_customers", "avg_units".
+statuses: list of order statuses to include, from {STATUSES}. Revenue/sales/spend/top-selling/average order value/units sold questions use ["paid"]. Refund questions use ["refunded"]. Voided/cancelled use ["void"]. "All orders" regardless of status uses all statuses. Order counts with no status qualifier use ["paid"].
+region: list of regions from {REGIONS} or [].
+product: list of products from {PRODUCTS} or [].
+customer: list of customer ids (like C1234) or [].
+start_date, end_date: inclusive ISO dates YYYY-MM-DD for the period asked about (business dates), or null. Data covers 2025-12 to 2026-06; a month without a year means 2026.
+group_by: null, or "product", "customer", "region", "month" when the question asks WHICH entity/month is top/bottom/best/worst/most/least.
+order: "desc" for top/most/highest/best, "asc" for least/lowest/worst.
+"""
+
+
+def llm_query(question):
+    token = os.environ.get("AIPIPE_TOKEN")
+    if not token:
+        return None
+    orders, _ = load()
+    prompt = (LLM_SYSTEM.replace("{STATUSES}", json.dumps(sorted({o["status"] for o in orders})))
+              .replace("{REGIONS}", json.dumps(sorted({o["region"] for o in orders})))
+              .replace("{PRODUCTS}", json.dumps(sorted({o["product"] for o in orders}))))
+    body = json.dumps({"model": "gpt-4.1-mini", "temperature": 0,
+                       "response_format": {"type": "json_object"},
+                       "messages": [{"role": "system", "content": prompt},
+                                    {"role": "user", "content": question}]}).encode()
+    req = urllib.request.Request("https://aipipe.org/openai/v1/chat/completions", data=body, headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        out = json.loads(r.read().decode())
+    return json.loads(out["choices"][0]["message"]["content"])
+
+
+def run_query(spec):
+    orders, _ = load()
+    from datetime import date as _d
+    sd = _d.fromisoformat(spec["start_date"]) if spec.get("start_date") else None
+    ed = _d.fromisoformat(spec["end_date"]) if spec.get("end_date") else None
+    sts = set(s.lower() for s in (spec.get("statuses") or ["paid"]))
+    reg = set(spec.get("region") or [])
+    prod = set(spec.get("product") or [])
+    cust = set(c.upper() for c in (spec.get("customer") or []))
+    rows = [o for o in orders
+            if o["status"] in sts
+            and (not reg or o["region"] in reg)
+            and (not prod or o["product"] in prod)
+            and (not cust or o["customer"].upper() in cust)
+            and (not sd or o["date"] >= sd) and (not ed or o["date"] <= ed)]
+    metric = spec.get("metric", "revenue")
+
+    def val(rs):
+        if metric == "order_count":
+            return len(rs)
+        if metric == "units":
+            return sum(o["qty"] for o in rs)
+        if metric == "avg_order_value":
+            return sum(o["usd"] for o in rs) / len(rs) if rs else 0
+        if metric == "avg_units":
+            return sum(o["qty"] for o in rs) / len(rs) if rs else 0
+        if metric == "distinct_customers":
+            return len({o["customer"] for o in rs})
+        return sum(o["usd"] for o in rs)
+
+    g = spec.get("group_by")
+    if g:
+        groups = defaultdict(list)
+        for o in rows:
+            k = o["date"].strftime("%B") if g == "month" else o[g]
+            groups[k].append(o)
+        if not groups:
+            return None
+        items = [(round(val(v), 6), k) for k, v in groups.items()]
+        items.sort(key=lambda t: (t[0], t[1]), reverse=(spec.get("order", "desc") != "asc"))
+        return items[0][1]
+    v = val(rows)
+    if metric in ("order_count", "units", "distinct_customers"):
+        return int(round(v))
+    return round(v + 1e-9, 2)
+
+
 @app.post("/ledger")
 @app.post("/")
 async def ledger(request: Request):
@@ -381,6 +459,12 @@ async def ledger(request: Request):
     except Exception:
         body = {}
     question = (body or {}).get("question", "")
+    try:
+        spec = llm_query(question)
+        if spec:
+            return {"answer": run_query(spec)}
+    except Exception:
+        pass
     try:
         ans = answer_question(question)
     except Exception as e:  # keep the service answering
